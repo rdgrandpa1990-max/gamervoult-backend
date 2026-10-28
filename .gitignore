@@ -8,3 +8,10 @@ yarn-error.log*
 .vscode/
 serviceAccountKey.json
 *.backup
+deploy_secrets.*
+deploy_tokens.env
+*.tokens
+.env.*
+.vercel
+
+.vercel
