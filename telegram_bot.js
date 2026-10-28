@@ -1,9 +1,8 @@
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 
-// Bot token: env var > hardcoded fallback
-const HARDCODED_BOT_TOKEN = '8700234031:AAFmFxuHnvQXREQ91C95ImK2bbZzlMY-1wI';
-let botToken = process.env.TELEGRAM_BOT_TOKEN || HARDCODED_BOT_TOKEN;
+// Bot token: strictly loaded from environment variable
+let botToken = process.env.TELEGRAM_BOT_TOKEN || '';
 
 // In-memory conversation state for multi-step signup
 // chatId -> { step: 'await_email' | 'await_password', keyId, keyData, availableEmail }
@@ -63,6 +62,11 @@ export async function initTelegramBot(db, app, admin) {
   _adminRef = admin;
   _auth = admin && admin.apps && admin.apps.length > 0 ? admin.auth() : null;
 
+  if (!botToken) {
+    console.log('ℹ️ TELEGRAM_BOT_TOKEN not configured. Telegram bot is disabled.');
+    return;
+  }
+
   // Verify token
   try {
     const res = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
@@ -79,6 +83,13 @@ export async function initTelegramBot(db, app, admin) {
 
   // Register webhook endpoint (for production webhook deployments)
   app.post('/telegram/webhook', async (req, res) => {
+    // Validate secret token if configured (SEC-LOW-02)
+    if (process.env.TELEGRAM_WEBHOOK_SECRET) {
+      const incomingSecret = req.headers['x-telegram-bot-api-secret-token'];
+      if (incomingSecret !== process.env.TELEGRAM_WEBHOOK_SECRET) {
+        return res.status(403).send('Forbidden: Invalid Webhook Secret');
+      }
+    }
     res.sendStatus(200);
     try {
       const update = req.body;

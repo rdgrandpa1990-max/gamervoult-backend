@@ -8,6 +8,8 @@ import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import admin from 'firebase-admin';
 import { initTelegramBot } from './telegram_bot.js';
+import { verifyFirebaseAuth, requireRoles, validateHostSecurity } from './authMiddleware.js';
+import gamervoultRouter from './gamervoultRouter.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -96,7 +98,16 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'x-api-key', 'Bypass-Tunnel-Reminder', 'bypass-tunnel-reminder']
 }));
 app.options('*', cors());
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
+
+// Global Security Headers Middleware
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
+});
 
 // ------------------------------------------------------------
 // Production Security 1: IP Rate Limiting (15 req/min per IP)
@@ -115,18 +126,32 @@ const otpRateLimiter = rateLimit({
 });
 
 // ------------------------------------------------------------
-// Production Security 2: API Key Authentication Middleware
+// Production Security 2: API Key / Firebase Token Authentication
+// SEC-HIGH-03 Remediation: No fallback secret constant
 // ------------------------------------------------------------
-const API_SECRET_KEY = process.env.API_SECRET_KEY || 'garena_sec_9988_a7f92b4c81d3';
+const API_SECRET_KEY = process.env.API_SECRET_KEY || '';
 
-const verifyApiKey = (req, res, next) => {
+const verifyApiKey = async (req, res, next) => {
   let key = req.headers['x-api-key'] || '';
   const authHeader = req.headers['authorization'] || '';
+
+  // 1. If Bearer token is provided, verify using Firebase Admin
   if (authHeader.startsWith('Bearer ')) {
-    key = authHeader.substring(7).trim();
+    const token = authHeader.substring(7).trim();
+    if (token && admin.apps.length > 0) {
+      try {
+        const decoded = await admin.auth().verifyIdToken(token);
+        req.user = decoded;
+        req.uid = decoded.uid;
+        return next();
+      } catch (tokenErr) {
+        // Fall through to API key check if token fails
+      }
+    }
   } else if (!key && authHeader) {
     key = authHeader.trim();
   }
+
   if (!key && req.query && req.query.key) {
     key = String(req.query.key).trim();
   }
@@ -134,14 +159,16 @@ const verifyApiKey = (req, res, next) => {
     key = String(req.body.key).trim();
   }
 
-  if (!key || key !== API_SECRET_KEY) {
-    return res.status(401).json({
-      success: false,
-      error: 'Unauthorized: Invalid or missing API key'
-    });
+  // 2. If valid server-configured secret key is provided
+  if (API_SECRET_KEY && key === API_SECRET_KEY) {
+    return next();
   }
 
-  next();
+  return res.status(401).json({
+    success: false,
+    error: 'Unauthorized',
+    message: 'Valid Firebase ID token or server API key is required.'
+  });
 };
 
 // ------------------------------------------------------------
@@ -166,12 +193,16 @@ app.all(['/accounts', '/list', '/debug', '/api/accounts', '/users', '/credential
 });
 
 // ============================================================
-// 1. POST /imap/test — Verify IMAP connection credentials
+// 1. POST /imap/test — Verify IMAP connection credentials (Protected & SSRF-Hardened)
 // ============================================================
-app.post('/imap/test', async (req, res) => {
+app.post('/imap/test', verifyFirebaseAuth, requireRoles(['staff', 'employee', 'admin', 'superadmin']), async (req, res) => {
   const { host, port, user, pass, secure } = req.body;
   if (!host || !user || !pass) {
     return res.status(400).json({ error: 'Missing required fields: host, user, pass' });
+  }
+
+  if (!validateHostSecurity(host)) {
+    return res.status(400).json({ error: 'Security Exception: Prohibited or internal host destination.' });
   }
 
   const cleanUser = String(user).trim();
@@ -214,12 +245,16 @@ app.post('/imap/test', async (req, res) => {
 });
 
 // ============================================================
-// 2. POST /imap/fetch — Fetch recent messages from folders
+// 2. POST /imap/fetch — Fetch recent messages from folders (Protected & SSRF-Hardened)
 // ============================================================
-app.post('/imap/fetch', async (req, res) => {
+app.post('/imap/fetch', verifyFirebaseAuth, requireRoles(['staff', 'employee', 'admin', 'superadmin']), async (req, res) => {
   const { host, port, user, pass, secure, folders, limit, query: searchQuery } = req.body;
   if (!host || !user || !pass) {
     return res.status(400).json({ error: 'Missing required fields: host, user, pass' });
+  }
+
+  if (!validateHostSecurity(host)) {
+    return res.status(400).json({ error: 'Security Exception: Prohibited or internal host destination.' });
   }
 
   const limitVal = Math.min(parseInt(limit) || 15, 50);
@@ -1504,6 +1539,11 @@ app.all(['/api/customer/info', '/api/customer-details', '/api/terms-acceptance',
     message: 'Only GET requests are permitted on this endpoint.'
   });
 });
+
+// ============================================================
+// Gamervoult & Secure Platform Router (Phase 5, 6, 8 Endpoints)
+// ============================================================
+app.use('/', gamervoultRouter);
 
 // Catch-all 404 for any unknown route (Scanners / Crawlers receive generic 404)
 app.use((req, res) => {
