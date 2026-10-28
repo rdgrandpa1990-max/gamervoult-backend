@@ -28,6 +28,36 @@ const db = new Proxy({}, {
   }
 });
 
+// Timing-safe constant-time string comparison for webhook/API secrets
+function timingSafeEqualStr(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length === 0 || bufB.length === 0 || bufA.length !== bufB.length) {
+    const dummy = Buffer.alloc(32, 0);
+    crypto.timingSafeEqual(dummy, dummy);
+    return false;
+  }
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+// Strict URL validation: must be valid HTTPS
+function isValidReleaseUrl(urlStr) {
+  if (!urlStr || typeof urlStr !== 'string') return false;
+  try {
+    const parsed = new URL(urlStr);
+    return parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+// Strict SHA-256 hash validation: exactly 64 hexadecimal characters
+function isValidSha256(hashStr) {
+  if (!hashStr || typeof hashStr !== 'string') return false;
+  return /^[a-fA-F0-9]{64}$/.test(hashStr.trim());
+}
+
 // =========================================================================
 // 1. Mandatory App Version & APK Check (Phase 8 - CFG-03)
 // =========================================================================
@@ -40,7 +70,9 @@ router.get('/api/v1/app/version-check', async (req, res) => {
     let minVersionCode = parseInt(process.env.MINIMUM_ANDROID_VERSION_CODE, 10) || 1;
     let latestVersionCode = parseInt(process.env.LATEST_ANDROID_VERSION_CODE, 10) || 1;
     let latestVersionName = process.env.LATEST_ANDROID_VERSION_NAME || '1.0.0';
-    let downloadUrl = process.env.LATEST_APK_DOWNLOAD_URL || 'https://freefireofficial.in/downloads/gamervoult.apk';
+    let downloadUrl = process.env.LATEST_APK_DOWNLOAD_URL || null;
+    let sha256Checksum = process.env.LATEST_APK_SHA256 || null;
+    let fileSizeBytes = process.env.LATEST_APK_SIZE_BYTES ? parseInt(process.env.LATEST_APK_SIZE_BYTES, 10) : null;
     let changelog = process.env.APP_CHANGELOG || 'Initial Gamervoult release: secure escrow desk, verified catalog, real-time support chat, and dynamic UPI QR payments.';
 
     // Check Firestore /app_config/android for live override
@@ -53,6 +85,8 @@ router.get('/api/v1/app/version-check', async (req, res) => {
           if (cfg.latestVersionCode != null) latestVersionCode = parseInt(cfg.latestVersionCode, 10);
           if (cfg.latestVersionName) latestVersionName = String(cfg.latestVersionName);
           if (cfg.downloadUrl) downloadUrl = String(cfg.downloadUrl);
+          if (cfg.sha256Checksum) sha256Checksum = String(cfg.sha256Checksum);
+          if (cfg.fileSizeBytes != null) fileSizeBytes = parseInt(cfg.fileSizeBytes, 10);
           if (cfg.changelog) changelog = String(cfg.changelog);
         }
       } catch (dbErr) {
@@ -62,6 +96,13 @@ router.get('/api/v1/app/version-check', async (req, res) => {
 
     const mandatoryUpdate = clientVersionCode > 0 && clientVersionCode < minVersionCode;
     const updateAvailable = clientVersionCode > 0 && clientVersionCode < latestVersionCode;
+    const isArtifactAvailable = Boolean(
+      downloadUrl &&
+      isValidReleaseUrl(downloadUrl) &&
+      sha256Checksum &&
+      isValidSha256(sha256Checksum) &&
+      (fileSizeBytes == null || (!isNaN(fileSizeBytes) && fileSizeBytes > 100000))
+    );
 
     return res.status(200).json({
       success: true,
@@ -72,7 +113,10 @@ router.get('/api/v1/app/version-check', async (req, res) => {
       latestVersionName,
       updateAvailable,
       mandatoryUpdate,
-      downloadUrl,
+      isArtifactAvailable,
+      downloadUrl: isArtifactAvailable ? downloadUrl : null,
+      sha256Checksum: isArtifactAvailable ? sha256Checksum : null,
+      fileSizeBytes: isArtifactAvailable ? fileSizeBytes : null,
       changelog,
       checkedAt: new Date().toISOString()
     });
@@ -488,23 +532,46 @@ router.get('/api/v1/orders/:orderCode', async (req, res) => {
 router.post('/api/webhooks/payment', async (req, res) => {
   if (!db) return res.status(503).json({ success: false, error: 'Database unavailable' });
 
-  // 1. Verify Webhook Secret / Signature
-  const expectedSecret = process.env.UPI_GATEWAY_WEBHOOK_SECRET || process.env.UPI_GATEWAY_API_KEY;
-  const incomingSecret = req.headers['x-webhook-secret'] || req.headers['x-api-key'];
-
-  if (expectedSecret && incomingSecret !== expectedSecret) {
-    console.warn('[Webhook] Rejected unauthorized webhook call.');
-    return res.status(403).json({ success: false, error: 'Forbidden: Invalid webhook secret' });
+  // 1. Fail-Closed Authentication: Expected secret MUST be configured and match incoming header
+  // Note: VITE_UPI_GATEWAY_API_KEY is deliberately excluded as client-side keys must not be trusted on backend.
+  const expectedSecret = process.env.UPI_GATEWAY_WEBHOOK_SECRET || process.env.UPI_GATEWAY_API_KEY || '';
+  
+  let incomingSecret = req.headers['x-webhook-secret'] || req.headers['x-api-key'] || '';
+  if (!incomingSecret && req.headers['authorization']) {
+    const authHeader = String(req.headers['authorization']).trim();
+    if (authHeader.startsWith('Bearer ')) {
+      incomingSecret = authHeader.slice(7).trim();
+    } else {
+      incomingSecret = authHeader;
+    }
   }
 
-  const { orderCode, status, utr, amount } = req.body;
+  if (!expectedSecret) {
+    console.error('[Webhook] CRITICAL: Payment gateway webhook secret is not configured on server. Rejecting call.');
+    return res.status(503).json({ success: false, error: 'Configuration Error: Webhook authentication secret not configured.' });
+  }
+
+  if (!incomingSecret || !timingSafeEqualStr(String(incomingSecret).trim(), expectedSecret.trim())) {
+    console.warn('[Webhook] Rejected unauthorized webhook call: Invalid or missing secret.');
+    return res.status(401).json({ success: false, error: 'Unauthorized: Invalid or missing webhook secret.' });
+  }
+
+  const { orderCode, status, utr, transactionId, amount, currency } = req.body;
 
   if (!orderCode || !status) {
     return res.status(400).json({ success: false, error: 'Missing required webhook fields: orderCode, status' });
   }
 
+  const cleanOrderCode = String(orderCode).trim();
+  const cleanStatus = String(status).trim().toUpperCase();
+
+  const allowedStatuses = ['PAID', 'FAILED', 'EXPIRED'];
+  if (!allowedStatuses.includes(cleanStatus)) {
+    return res.status(400).json({ success: false, error: `Invalid order status: ${cleanStatus}. Must be one of ${allowedStatuses.join(', ')}` });
+  }
+
   try {
-    const orderRef = db.collection('payment_orders').doc(String(orderCode).trim());
+    const orderRef = db.collection('payment_orders').doc(cleanOrderCode);
     const orderSnap = await orderRef.get();
 
     if (!orderSnap.exists) {
@@ -513,24 +580,79 @@ router.post('/api/webhooks/payment', async (req, res) => {
 
     const currentOrder = orderSnap.data();
 
-    // Idempotent processing: if already marked PAID, return 200 OK immediately
+    // Idempotent processing & Terminal state lock: if already marked PAID, prevent any conflicting status changes
     if (currentOrder.status === 'PAID') {
-      return res.status(200).json({ success: true, message: 'Order already processed as PAID.' });
+      return res.status(200).json({ success: true, message: 'Order already processed as PAID. Status is terminal and cannot be overridden.' });
     }
 
-    if (String(status).toUpperCase() === 'PAID') {
+    // Terminal state lock: if order is CANCELLED, reject transitions
+    if (currentOrder.status === 'CANCELLED') {
+      return res.status(409).json({ success: false, error: 'Order is already CANCELLED and cannot be modified.' });
+    }
+
+    // 2. Currency Validation: ensure currency matches authoritative order currency
+    if (currency !== undefined && currency !== null) {
+      const orderCurrency = String(currentOrder.currency || 'INR').trim().toUpperCase();
+      const webhookCurrency = String(currency).trim().toUpperCase();
+      if (webhookCurrency !== orderCurrency) {
+        console.error(`[Webhook] Currency mismatch for ${cleanOrderCode}: expected ${orderCurrency}, received ${webhookCurrency}`);
+        return res.status(400).json({ success: false, error: `Currency mismatch detected: expected ${orderCurrency}, received ${webhookCurrency}` });
+      }
+    }
+
+    // 3. Amount Validation: If amount provided in webhook, ensure it strictly matches order amount
+    if (amount !== undefined && amount !== null && !isNaN(Number(amount))) {
+      const webhookAmount = Number(amount);
+      const expectedAmount = Number(currentOrder.amount);
+      if (webhookAmount !== expectedAmount) {
+        console.error(`[Webhook] Amount mismatch for ${cleanOrderCode}: expected ${expectedAmount}, received ${webhookAmount}`);
+        return res.status(400).json({ success: false, error: 'Amount mismatch detected between webhook and order.' });
+      }
+    }
+
+    // 4. Payment Evidence & Replay Protection for PAID transitions
+    const paymentEvidence = utr ? String(utr).trim() : (transactionId ? String(transactionId).trim() : '');
+
+    if (cleanStatus === 'PAID') {
+      if (!paymentEvidence || paymentEvidence.length < 4) {
+        return res.status(400).json({
+          success: false,
+          error: 'Missing or invalid payment evidence (UTR / transactionId) required to mark order as PAID.'
+        });
+      }
+
+      // Replay Protection: Query whether this transaction reference was already recorded on any other order
+      const existingUtrDocs = await db.collection('payment_orders')
+        .where('utr', '==', paymentEvidence)
+        .limit(2)
+        .get();
+
+      const isReplayed = existingUtrDocs.docs.some(doc => doc.id !== cleanOrderCode);
+      if (isReplayed) {
+        console.error(`[Webhook] REPLAY DETECTED: UTR ${paymentEvidence} was already used on another order.`);
+        return res.status(409).json({
+          success: false,
+          error: 'Replay conflict: Payment transaction reference (UTR) has already been applied to another order.'
+        });
+      }
+
       await orderRef.update({
         status: 'PAID',
         paidAt: new Date().toISOString(),
-        utr: utr || 'WEBHOOK_VERIFIED',
+        utr: paymentEvidence,
         webhookReceivedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       });
 
-      console.log(`✅ [Webhook] Order ${orderCode} verified and marked PAID!`);
+      console.log(`✅ [Webhook] Order ${cleanOrderCode} verified and marked PAID with UTR ${paymentEvidence}`);
+      return res.status(200).json({ success: true, message: `Payment confirmed and verified for order ${cleanOrderCode}` });
+    } else if (cleanStatus === 'FAILED' || cleanStatus === 'EXPIRED') {
+      await orderRef.update({
+        status: cleanStatus,
+        updatedAt: new Date().toISOString()
+      });
+      return res.status(200).json({ success: true, message: `Status updated to ${cleanStatus} for ${cleanOrderCode}` });
     }
-
-    return res.status(200).json({ success: true, message: `Webhook processed for ${orderCode}` });
 
   } catch (err) {
     console.error('[Webhook] Processing error:', err.message);
@@ -778,6 +900,229 @@ router.post('/api/v1/license/redeem', verifyFirebaseAuth, async (req, res) => {
     }
     console.error('[LicenseRedeem] Transaction error:', err);
     return res.status(500).json({ success: false, error: 'Internal error processing license redemption.' });
+  }
+});
+
+// =========================================================================
+// 7.1 Single-Use Burn-Before-Creation Signup Architecture
+// SEC-CRIT-02 Remediation: Key is atomically locked/burned BEFORE Auth creation.
+// Eliminates duplicate accounts, race conditions, and orphan auth entries.
+// =========================================================================
+router.post('/api/v1/license/signup', async (req, res) => {
+  try {
+    const { licenseKey, email, password, name, mobile, instagramId, dpdpConsent } = req.body || {};
+
+    if (!licenseKey || typeof licenseKey !== 'string') {
+      return res.status(400).json({ success: false, error: 'Please enter a valid License Key.' });
+    }
+    const cleanKey = licenseKey.trim();
+    if (!cleanKey) {
+      return res.status(400).json({ success: false, error: 'Please enter a valid License Key.' });
+    }
+
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ success: false, error: 'Please enter a valid email address.' });
+    }
+    const cleanEmail = email.trim().toLowerCase();
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(cleanEmail)) {
+      return res.status(400).json({ success: false, error: 'Please enter a valid email address.' });
+    }
+
+    if (!password || typeof password !== 'string' || password.length < 6) {
+      return res.status(400).json({ success: false, error: 'Password must be at least 6 characters.' });
+    }
+
+    if (!dpdpConsent) {
+      return res.status(400).json({ success: false, error: 'You must agree to the Privacy Policy and DPDP consent to register.' });
+    }
+
+    if (!db) {
+      return res.status(500).json({ success: false, error: 'Firestore database uninitialized.' });
+    }
+
+    // 1. Check if user already exists in Firebase Auth
+    let existingAuthUser = null;
+    try {
+      existingAuthUser = await admin.auth().getUserByEmail(cleanEmail);
+    } catch (e) {
+      if (e.code !== 'auth/user-not-found') {
+        console.warn('[LicenseSignup] Auth lookup warning:', e.message);
+      }
+    }
+
+    if (existingAuthUser) {
+      const existingProfileSnap = await db.collection('users').doc(existingAuthUser.uid).get();
+      if (existingProfileSnap.exists) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'This email address is already registered. Please sign in directly.' 
+        });
+      }
+    }
+
+    const keyRef = db.collection('license_keys').doc(cleanKey);
+    let assignedMailbox = null;
+    let mailboxType = null;
+    const now = new Date();
+    const expiry = new Date(now.getTime() + 48 * 60 * 60 * 1000); // 48-hour entitlement
+
+    // 2. ATOMIC FIRESTORE TRANSACTION: Burn key BEFORE any account is created!
+    // Ensures strictly 1 key = 1 account. Any concurrent race fails here with 409 Conflict.
+    await db.runTransaction(async (transaction) => {
+      const keyDoc = await transaction.get(keyRef);
+      if (!keyDoc.exists) {
+        throw new Error('LICENSE_NOT_FOUND');
+      }
+
+      const keyData = keyDoc.data();
+      if (keyData.status !== 'active') {
+        throw new Error('LICENSE_ALREADY_REDEEMED');
+      }
+
+      if (keyData.redeemedBy || keyData.usedBy) {
+        throw new Error('LICENSE_ALREADY_REDEEMED');
+      }
+
+      assignedMailbox = keyData.assignedMailbox || null;
+      mailboxType = keyData.mailboxType || null;
+
+      // Atomically burn key immediately
+      transaction.update(keyRef, {
+        status: 'redeemed',
+        redeemedByEmail: cleanEmail,
+        redeemedAt: admin.firestore.FieldValue.serverTimestamp(),
+        burnPhase: 'burn_before_creation'
+      });
+    });
+
+    // 3. Key is successfully burned. Now proceed with Auth Account Creation
+    let user;
+    try {
+      if (existingAuthUser) {
+        user = existingAuthUser;
+        await admin.auth().updateUser(user.uid, {
+          password: password,
+          displayName: (name || '').trim()
+        });
+      } else {
+        user = await admin.auth().createUser({
+          email: cleanEmail,
+          password: password,
+          displayName: (name || '').trim()
+        });
+      }
+    } catch (authCreateErr) {
+      // ROLLBACK SAFETY NET: If Auth account creation fails, rollback key status to 'active'
+      console.error('[LicenseSignup] Auth creation failed after burn, executing rollback:', authCreateErr.message);
+      try {
+        await keyRef.update({
+          status: 'active',
+          redeemedByEmail: null,
+          redeemedAt: null,
+          burnPhase: null
+        });
+        await db.collection('audit_logs').add({
+          event: 'LICENSE_SIGNUP_ROLLBACK',
+          licenseKey: cleanKey,
+          email: cleanEmail,
+          reason: authCreateErr.message,
+          timestamp: admin.firestore.FieldValue.serverTimestamp()
+        });
+      } catch (rbErr) {
+        console.error('[LicenseSignup] Critical rollback failure:', rbErr);
+      }
+      return res.status(400).json({ 
+        success: false, 
+        error: authCreateErr.message || 'Failed to create authentication account.' 
+      });
+    }
+
+    const uid = user.uid;
+
+    // 4. Update Key with final UID, write User Profile and Subscriptions using Admin batch
+    let cleanInstaUser = '';
+    let cleanInstaLink = '';
+    if (instagramId && typeof instagramId === 'string') {
+      let str = instagramId.trim().replace(/^(?:https?:\/\/)?(?:www\.)?(?:instagram\.com\/)?/, '').replace(/^[@/]+/, '');
+      const match = str.match(/^([a-zA-Z0-9._-]+)/);
+      cleanInstaUser = match ? match[1] : '';
+      cleanInstaLink = cleanInstaUser ? `https://instagram.com/${cleanInstaUser}` : '';
+    }
+
+    const userProfile = {
+      uid: uid,
+      name: (name || '').trim(),
+      email: cleanEmail,
+      mobile: (mobile || '').trim(),
+      instagramId: cleanInstaUser,
+      instagram_link: cleanInstaLink,
+      role: 'client',
+      status: 'active',
+      createdAt: now.toISOString(),
+      usedLicenseKey: cleanKey,
+      dpdpConsentGiven: true,
+      dpdpConsentTimestamp: now.toISOString(),
+      dpdpConsentVersion: 'v1.0-sept2026'
+    };
+
+    if (mailboxType === 'gmail' && assignedMailbox) userProfile.linkedGmail = assignedMailbox;
+    if (mailboxType === 'zoho' && assignedMailbox) userProfile.linkedZoho = assignedMailbox;
+    if (mailboxType === 'imap' && assignedMailbox) userProfile.linkedImap = assignedMailbox;
+
+    const userRef = db.collection('users').doc(uid);
+    const subRef = db.collection('subscriptions').doc(uid);
+
+    const finalBatch = db.batch();
+    finalBatch.set(userRef, userProfile);
+    finalBatch.update(keyRef, {
+      status: 'redeemed',
+      redeemedBy: uid,
+      redeemedByEmail: cleanEmail,
+      redeemedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    finalBatch.set(subRef, {
+      productName: 'License Key Activation',
+      purchaseDate: now.toISOString(),
+      expiryDate: expiry.toISOString(),
+      validityDays: 2,
+      amountPaid: 0,
+      status: 'Active',
+      notes: `Activated via License Key: ${cleanKey}`,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    await finalBatch.commit();
+
+    // 5. Authoritative Custom Claims
+    try {
+      await admin.auth().setCustomUserClaims(uid, { role: 'client' });
+    } catch (claimErr) {
+      console.warn('[LicenseSignup] Custom claims notice:', claimErr.message);
+    }
+
+    // 6. Create custom token for automatic client authentication
+    const customToken = await admin.auth().createCustomToken(uid);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Account registered successfully! Welcome.',
+      customToken,
+      uid,
+      email: cleanEmail,
+      assignedMailbox,
+      mailboxType
+    });
+
+  } catch (err) {
+    if (err.message === 'LICENSE_NOT_FOUND') {
+      return res.status(404).json({ success: false, error: 'Invalid License Key. Please contact the administrator.' });
+    }
+    if (err.message === 'LICENSE_ALREADY_REDEEMED') {
+      return res.status(409).json({ success: false, error: 'This License Key is invalid, expired, or has already been claimed.' });
+    }
+    console.error('[LicenseSignup] Transaction error:', err);
+    return res.status(500).json({ success: false, error: 'Internal error processing license registration.' });
   }
 });
 
