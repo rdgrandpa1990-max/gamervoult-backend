@@ -4,7 +4,29 @@ import admin from 'firebase-admin';
 import { verifyFirebaseAuth, requireRoles } from './authMiddleware.js';
 
 const router = express.Router();
-const db = admin.apps.length > 0 ? admin.firestore() : null;
+function getDbInstance() {
+  if (!admin.apps.length) {
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+      try {
+        const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+        admin.initializeApp({ credential: admin.credential.cert(sa) });
+      } catch {
+        admin.initializeApp({ projectId: 'ff-store-4a61e' });
+      }
+    } else {
+      admin.initializeApp({ projectId: 'ff-store-4a61e' });
+    }
+  }
+  return admin.firestore();
+}
+
+const db = new Proxy({}, {
+  get(target, prop) {
+    const firestoreInstance = getDbInstance();
+    const val = firestoreInstance[prop];
+    return typeof val === 'function' ? val.bind(firestoreInstance) : val;
+  }
+});
 
 // =========================================================================
 // 1. Mandatory App Version & APK Check (Phase 8 - CFG-03)
@@ -685,7 +707,11 @@ router.post('/api/v1/license/redeem', verifyFirebaseAuth, async (req, res) => {
 
       const keyData = keyDoc.data();
       if (keyData.status !== 'active') {
-        throw new Error('LICENSE_ALREADY_REDEEMED');
+        if (keyData.redeemedBy === uid || keyData.redeemedByEmail === email) {
+          // Idempotent retry by the same user: proceed to verify/provision subscription
+        } else {
+          throw new Error('LICENSE_ALREADY_REDEEMED');
+        }
       }
 
       assignedMailbox = keyData.assignedMailbox || null;
