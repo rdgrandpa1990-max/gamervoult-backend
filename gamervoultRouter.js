@@ -94,8 +94,8 @@ router.get('/api/v1/app/version-check', async (req, res) => {
       }
     }
 
-    const mandatoryUpdate = clientVersionCode > 0 && clientVersionCode < minVersionCode;
-    const updateAvailable = clientVersionCode > 0 && clientVersionCode < latestVersionCode;
+    const mandatoryUpdate = clientVersionCode < minVersionCode;
+    const updateAvailable = clientVersionCode < latestVersionCode;
     const isArtifactAvailable = Boolean(
       downloadUrl &&
       isValidReleaseUrl(downloadUrl) &&
@@ -362,9 +362,30 @@ router.post('/api/v1/orders/create', async (req, res) => {
       price = 0;
     }
 
-    // 2. Gateway Credentials
-    const gatewayUrl = (process.env.UPI_GATEWAY_URL || 'https://personal-payment-gateway.onrender.com').replace(/\/+$/, '');
-    const gatewayApiKey = process.env.UPI_GATEWAY_API_KEY || '';
+    // 2. Coupon & Discount handling
+    const { couponCode, discountAmount } = req.body;
+    let discount = 0;
+    if (discountAmount && !isNaN(discountAmount) && Number(discountAmount) > 0) {
+      discount = Number(discountAmount);
+      price = Math.max(0, price - discount);
+    }
+
+    // 3. Gateway Credentials (Hydrated from Firestore system_settings/payment_gateway if not in env)
+    let gatewayUrl = (process.env.UPI_GATEWAY_URL || 'https://personal-payment-gateway.onrender.com').replace(/\/+$/, '');
+    let gatewayApiKey = process.env.UPI_GATEWAY_API_KEY || '';
+
+    if (!gatewayApiKey && db) {
+      try {
+        const gwSnap = await db.collection('system_settings').doc('payment_gateway').get();
+        if (gwSnap.exists) {
+          const gwData = gwSnap.data();
+          if (gwData.apiKey) gatewayApiKey = gwData.apiKey;
+          if (gwData.gatewayUrl) gatewayUrl = gwData.gatewayUrl.trim().replace(/\/+$/, '');
+        }
+      } catch (gwErr) {
+        console.warn('[Orders] Gateway credentials fetch warning:', gwErr.message);
+      }
+    }
 
     // Generate clean internal order code: ORD-XXXXXX
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -475,8 +496,21 @@ router.get('/api/v1/orders/:orderCode', async (req, res) => {
     }
 
     // Query external gateway to verify if status has updated
-    const gatewayUrl = (process.env.UPI_GATEWAY_URL || 'https://personal-payment-gateway.onrender.com').replace(/\/+$/, '');
-    const gatewayApiKey = process.env.UPI_GATEWAY_API_KEY || '';
+    let gatewayUrl = (process.env.UPI_GATEWAY_URL || 'https://personal-payment-gateway.onrender.com').replace(/\/+$/, '');
+    let gatewayApiKey = process.env.UPI_GATEWAY_API_KEY || '';
+
+    if (!gatewayApiKey && db) {
+      try {
+        const gwSnap = await db.collection('system_settings').doc('payment_gateway').get();
+        if (gwSnap.exists) {
+          const gwData = gwSnap.data();
+          if (gwData.apiKey) gatewayApiKey = gwData.apiKey;
+          if (gwData.gatewayUrl) gatewayUrl = gwData.gatewayUrl.trim().replace(/\/+$/, '');
+        }
+      } catch (gwErr) {
+        console.warn('[Orders] Status poll gateway credentials fetch warning:', gwErr.message);
+      }
+    }
 
     if (gatewayApiKey) {
       try {
@@ -1024,7 +1058,7 @@ router.post('/api/v1/license/signup', async (req, res) => {
         });
         await db.collection('audit_logs').add({
           event: 'LICENSE_SIGNUP_ROLLBACK',
-          licenseKey: cleanKey,
+          keyHash: crypto.createHash('sha256').update(cleanKey).digest('hex'),
           email: cleanEmail,
           reason: authCreateErr.message,
           timestamp: admin.firestore.FieldValue.serverTimestamp()
@@ -1200,6 +1234,67 @@ router.post('/api/v1/auth/google-oauth-exchange', verifyFirebaseAuth, requireRol
   } catch (err) {
     console.error('[GoogleOAuthExchange] Error:', err);
     return res.status(500).json({ success: false, error: 'Failed to exchange authorization code.' });
+  }
+});
+
+// =========================================================================
+// 9. Secure Google OAuth Token Refresh (Phase 3c Remediation)
+// Refresh tokens are processed server-side; client secret is never exposed in browser
+// =========================================================================
+router.post('/api/v1/auth/google-refresh-token', async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+    if (!refreshToken) {
+      return res.status(400).json({ success: false, error: 'refreshToken is required.' });
+    }
+
+    let clientId = process.env.VITE_GOOGLE_CLIENT_ID || process.env.GOOGLE_CLIENT_ID;
+    let clientSecret = process.env.VITE_GOOGLE_CLIENT_SECRET || process.env.GOOGLE_CLIENT_SECRET;
+
+    if ((!clientId || !clientSecret) && db) {
+      try {
+        const oauthDoc = await db.collection('system_settings').doc('google_oauth').get();
+        if (oauthDoc.exists) {
+          const oauthData = oauthDoc.data();
+          clientId = clientId || oauthData.clientId || oauthData.client_id;
+          clientSecret = clientSecret || oauthData.clientSecret || oauthData.client_secret;
+        }
+      } catch (err) {
+        console.warn('[GoogleRefreshToken] Firestore settings read warning:', err.message);
+      }
+    }
+
+    if (!clientId || !clientSecret) {
+      return res.status(500).json({ success: false, error: 'Google OAuth credentials not configured on the server.' });
+    }
+
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: refreshToken,
+        grant_type: 'refresh_token'
+      })
+    });
+
+    const tokenData = await tokenRes.json();
+    if (!tokenRes.ok) {
+      return res.status(tokenRes.status || 400).json({
+        success: false,
+        error: tokenData.error_description || tokenData.error || 'Token refresh failed'
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      accessToken: tokenData.access_token,
+      expiresIn: tokenData.expires_in
+    });
+  } catch (err) {
+    console.error('[GoogleRefreshToken] Error:', err.message);
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 

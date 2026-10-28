@@ -92,8 +92,29 @@ app.disable('x-powered-by');
 // Trust proxy on Render (needed for accurate client IP rate limiting behind reverse proxy)
 app.set('trust proxy', 1);
 
+const allowedOrigins = [
+  'https://freefireofficial.in',
+  'https://www.freefireofficial.in',
+  'https://dealsbyshiv.web.app',
+  'https://dealsbyshiv.firebaseapp.com',
+  'https://ff-store-4a61e.web.app',
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:3000'
+];
+
 app.use(cors({
-  origin: '*',
+  origin: (origin, callback) => {
+    // Non-browser clients (curl, backend-to-backend, mobile apps) have no origin
+    if (!origin) return callback(null, true);
+    const normalized = origin.trim().replace(/\/+$/, '').toLowerCase();
+    if (allowedOrigins.some(ao => ao.toLowerCase() === normalized)) {
+      return callback(null, true);
+    }
+    return callback(new Error('CORS not allowed for origin: ' + origin), false);
+  },
+  credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'x-api-key', 'Bypass-Tunnel-Reminder', 'bypass-tunnel-reminder']
 }));
